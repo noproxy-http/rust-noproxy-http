@@ -31,29 +31,14 @@ use std::sync::Mutex;
 use std::thread;
 
 use lazy_static::lazy_static;
+use serde_derive::Deserialize;
+use serde_derive::Serialize;
 
 lazy_static! {
     static ref SENDER: Mutex<Option<Sender<Request>>> = Mutex::new(None);
     static ref RECEIVER: Mutex<Option<Receiver<Request>>> = Mutex::new(None);
-}
-
-#[allow(non_snake_case)]
-#[derive(serde_derive::Serialize, serde_derive::Deserialize)]
-struct Metadata {
-    uri: String,
-    args: String,
-    unparsedUri: String,
-    method: String,
-    protocol: String,
-    dataTempFile: Option<String>,
-    headers: HashMap<String, String>
-}
-
-struct Request {
-    handle: u64,
-    meta: Metadata,
-    data_ptr: u64,
-    data_len: usize
+    static ref SEND_RESPONSE: Mutex<Option<SendResponseFun>> = Mutex::new(None);
+    static ref HANDLER: Mutex<Option<fn(Request)>> = Mutex::new(None);
 }
 
 type SendResponseFun = fn(
@@ -62,50 +47,131 @@ type SendResponseFun = fn(
     headers: *const c_char,
     headers_len: c_int,
     data: *mut c_char,
-    data_len: c_int
+    data_len: c_int,
 ) -> c_int;
 
-fn receive_request(send_response: SendResponseFun) -> Result<(), Error> {
-    // get receiver
-    let guard = match RECEIVER.lock() {
+#[allow(non_snake_case)]
+#[derive(Serialize, Deserialize)]
+pub struct Metadata {
+    uri: String,
+    args: String,
+    unparsedUri: String,
+    method: String,
+    protocol: String,
+    dataTempFile: Option<String>,
+    headers: HashMap<String, String>,
+}
+
+pub struct Request {
+    handle: u64,
+    meta: Metadata,
+    data_ptr: u64,
+    data_len: usize,
+}
+
+pub fn send_response(handle: u64, response_code: u16, headers: &HashMap<String, String>,
+                     data_ptr: *mut c_char, data_len: usize) -> Result<(), Error> {
+    let send_guard = match SEND_RESPONSE.lock() {
         Ok(guard) => guard,
         Err(err) => {
-            let msg = format!("Queue lock failed, message: [{}]", err.to_string());
+            let msg = format!("Error accessing send callback, error: [{}]", err);
+            return Err(Error::new(ErrorKind::Other, msg));
+        }
+    };
+    let send = match &*send_guard {
+        Some(val) => val,
+        None => {
+            let msg = format!("Error accessing send callback");
+            return Err(Error::new(ErrorKind::Other, msg));
+        }
+    };
+    // send
+    let headers_json = serde_json::to_vec(&headers)?;
+    let headers_ptr = headers_json.as_ptr() as *const c_char;
+    let handle_ptr = handle as *mut c_void;
+    match send(handle_ptr, response_code as c_int, headers_ptr, headers_json.len() as c_int, data_ptr, data_len as c_int) {
+        0 => Ok(()),
+        err => {
+            let msg = format!("Error sending repsonse, code: [{}]", err);
+            Err(Error::new(ErrorKind::Other, msg))
+        }
+    }
+}
+
+// todo
+pub fn send_json() -> () {}
+
+pub fn set_handler(handler: fn(Request)) -> Result<(), Error> {
+    let mut handler_guard = match HANDLER.lock() {
+        Ok(val) => val,
+        Err(err) => {
+            let msg = format!("Error setting handler, message: [{}]", err);
             return Err(Error::new(ErrorKind::Other, msg))
         }
     };
-    let receiver = match &*guard {
+    let global_hander = &mut *handler_guard;
+    *global_hander = Some(handler);
+    Ok(())
+}
+
+fn default_handler(req: Request) -> () {
+    let msg = format!("Hello from Rust, your request was received on path: [{}]\n", req.meta.uri);
+    let bytes = msg.as_bytes();
+    let data_ptr = unsafe {
+        let buf: *mut c_char = libc::malloc(bytes.len()) as *mut c_char;
+        let src = bytes.as_ptr() as *mut c_void;
+        let dest = buf as *mut c_void;
+        libc::memcpy(dest, src, bytes.len());
+        buf
+    };
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("X-Custom-Rust-Header".to_string(), "foo".to_string());
+    let _ = send_response(req.handle, 200, &headers, data_ptr, bytes.len());
+}
+
+fn receive_request() -> Result<(), Error> {
+    // get receiver
+    let recv_guard = match RECEIVER.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            let msg = format!("Error accessing receiver, message: [{}]", err);
+            return Err(Error::new(ErrorKind::Other, msg));
+        }
+    };
+    let receiver = match &*recv_guard {
         Some(val) => val,
         None => {
-            let msg = format!("Queue unboxing failed");
-            return Err(Error::new(ErrorKind::Other, msg))
+            let msg = format!("Error accessing receiver");
+            return Err(Error::new(ErrorKind::Other, msg));
+        }
+    };
+
+    // get handler
+    let mut handler_guard = match HANDLER.lock() {
+        Ok(val) => val,
+        Err(err) => {
+            let msg = format!("Error accessing handler, message: [{}]", err);
+            return Err(Error::new(ErrorKind::Other, msg));
+        }
+    };
+    let handler = match &*handler_guard {
+        Some(val) => val,
+        None => {
+            let msg = format!("Error accessing handler");
+            return Err(Error::new(ErrorKind::Other, msg));
         }
     };
 
     // receive message
     match receiver.recv() {
         Ok(req) => {
-           let msg = format!("Hello from Rust, your request was received on path: [{}]\n", req.meta.uri);
-           let bytes = msg.as_bytes();
-           let data_ptr = unsafe {
-               let buf: *mut c_char = libc::malloc(bytes.len()) as *mut c_char;
-               let src = bytes.as_ptr() as *mut c_void;
-               let dest = buf as *mut c_void;
-               libc::memcpy(dest, src, bytes.len());
-               buf
-           };
-           let mut headers = HashMap::new();
-           headers.insert("X-Custom-Rust-Header", "foo");
-           let headers_json = serde_json::to_vec(&headers)?;
-           let headers_ptr = headers_json.as_ptr() as *const c_char;
-           let handle = req.handle as *mut c_void;
-           send_response(handle, 200, headers_ptr, headers_json.len() as c_int, data_ptr, bytes.len() as c_int);
-           Ok(())
-       }
-       Err(err) => {
-           let msg = format!("Queue receive failed, message: [{}]", err.to_string());
-           Err(Error::new(ErrorKind::Other, msg))
-       }
+            handler(req);
+            Ok(())
+        }
+        Err(err) => {
+            let msg = format!("Queue receive failed, message: [{}]", err.to_string());
+            Err(Error::new(ErrorKind::Other, msg))
+        }
     }
 }
 
@@ -113,7 +179,7 @@ fn receive_request(send_response: SendResponseFun) -> Result<(), Error> {
 fn bch_initialize(
     response_callback: SendResponseFun,
     handler_config: *const c_char,
-    handler_config_len: c_int
+    handler_config_len: c_int,
 ) -> c_int {
     let slice: &[u8] = unsafe {
         slice::from_raw_parts(handler_config as *const u8, handler_config_len as usize)
@@ -143,10 +209,29 @@ fn bch_initialize(
     let global_receiver = &mut *receiver_guard;
     *global_receiver = Some(receiver);
 
+    // set global response fun
+    let mut send_response_guard = match SEND_RESPONSE.lock() {
+        Ok(val) => val,
+        Err(_) => return -3
+    };
+    let global_send_response = &mut *send_response_guard;
+    *global_send_response = Some(response_callback);
+
+    // set default handler
+    let mut handler_guard = match HANDLER.lock() {
+        Ok(val) => val,
+        Err(_) => return -4
+    };
+    let global_hander = &mut *handler_guard;
+    *global_hander = Some(default_handler);
+
     // spawn worker thread
-    thread::spawn(move || {
+    thread::spawn(|| {
         loop {
-            let _ = receive_request(response_callback);
+            match receive_request() {
+                Ok(_) => (),
+                Err(err) => eprintln!("{}", err)
+            }
         }
     });
 
@@ -159,9 +244,8 @@ fn bch_receive_request(
     metadata: *const c_char,
     metadata_len: c_int,
     data: *const c_char,
-    data_len: c_int
+    data_len: c_int,
 ) -> c_int {
-
     let meta_slice: &[u8] = unsafe {
         slice::from_raw_parts(metadata as *const u8, metadata_len as usize)
     };
@@ -174,7 +258,7 @@ fn bch_receive_request(
         handle: handle as u64,
         meta,
         data_ptr: data as u64,
-        data_len: data_len as usize
+        data_len: data_len as usize,
     };
 
     eprintln!("Rust request received");
