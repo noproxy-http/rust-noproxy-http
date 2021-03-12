@@ -38,7 +38,7 @@ lazy_static! {
     static ref SENDER: Mutex<Option<Sender<Request>>> = Mutex::new(None);
     static ref RECEIVER: Mutex<Option<Receiver<Request>>> = Mutex::new(None);
     static ref SEND_RESPONSE: Mutex<Option<SendResponseFun>> = Mutex::new(None);
-    static ref HANDLER: Mutex<Option<fn(Request)>> = Mutex::new(None);
+    static ref HANDLER: Mutex<Option<Box<dyn Fn(Request) + Send>>> = Mutex::new(None);
 }
 
 type SendResponseFun = fn(
@@ -101,7 +101,7 @@ pub fn send_response(handle: u64, response_code: u16, headers: &HashMap<String, 
 // todo
 pub fn send_json() -> () {}
 
-pub fn set_handler(handler: fn(Request)) -> Result<(), Error> {
+pub fn set_handler(handler: Box<dyn Fn(Request) + Send>) -> Result<(), Error> {
     let mut handler_guard = match HANDLER.lock() {
         Ok(val) => val,
         Err(err) => {
@@ -223,7 +223,7 @@ fn bch_initialize(
         Err(_) => return -4
     };
     let global_hander = &mut *handler_guard;
-    *global_hander = Some(default_handler);
+    *global_hander = Some(Box::new(default_handler));
 
     // spawn worker thread
     thread::spawn(|| {
