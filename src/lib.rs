@@ -37,8 +37,6 @@ use serde_derive::Serialize;
 lazy_static! {
     static ref SENDER: Mutex<Option<Sender<Request>>> = Mutex::new(None);
     static ref RECEIVER: Mutex<Option<Receiver<Request>>> = Mutex::new(None);
-    static ref SEND_RESPONSE: Mutex<Option<SendResponseFun>> = Mutex::new(None);
-    static ref HANDLER: Mutex<Option<Box<dyn Fn(Request) + Send>>> = Mutex::new(None);
 }
 
 type SendResponseFun = fn(
@@ -52,7 +50,7 @@ type SendResponseFun = fn(
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize)]
-pub struct Metadata {
+struct Metadata {
     uri: String,
     args: String,
     unparsedUri: String,
@@ -62,59 +60,14 @@ pub struct Metadata {
     headers: HashMap<String, String>,
 }
 
-pub struct Request {
+struct Request {
     handle: u64,
     meta: Metadata,
     data_ptr: u64,
     data_len: usize,
 }
 
-pub fn send_response(handle: u64, response_code: u16, headers: &HashMap<String, String>,
-                     data_ptr: *mut c_char, data_len: usize) -> Result<(), Error> {
-    let send_guard = match SEND_RESPONSE.lock() {
-        Ok(guard) => guard,
-        Err(err) => {
-            let msg = format!("Error accessing send callback, error: [{}]", err);
-            return Err(Error::new(ErrorKind::Other, msg));
-        }
-    };
-    let send = match &*send_guard {
-        Some(val) => val,
-        None => {
-            let msg = format!("Error accessing send callback");
-            return Err(Error::new(ErrorKind::Other, msg));
-        }
-    };
-    // send
-    let headers_json = serde_json::to_vec(&headers)?;
-    let headers_ptr = headers_json.as_ptr() as *const c_char;
-    let handle_ptr = handle as *mut c_void;
-    match send(handle_ptr, response_code as c_int, headers_ptr, headers_json.len() as c_int, data_ptr, data_len as c_int) {
-        0 => Ok(()),
-        err => {
-            let msg = format!("Error sending repsonse, code: [{}]", err);
-            Err(Error::new(ErrorKind::Other, msg))
-        }
-    }
-}
-
-// todo
-pub fn send_json() -> () {}
-
-pub fn set_handler(handler: Box<dyn Fn(Request) + Send>) -> Result<(), Error> {
-    let mut handler_guard = match HANDLER.lock() {
-        Ok(val) => val,
-        Err(err) => {
-            let msg = format!("Error setting handler, message: [{}]", err);
-            return Err(Error::new(ErrorKind::Other, msg))
-        }
-    };
-    let global_hander = &mut *handler_guard;
-    *global_hander = Some(handler);
-    Ok(())
-}
-
-fn default_handler(req: Request) -> () {
+fn default_handler(req: Request, send_response: SendResponseFun) -> Result<(), Error> {
     let msg = format!("Hello from Rust, your request was received on path: [{}]\n", req.meta.uri);
     let bytes = msg.as_bytes();
     let data_ptr = unsafe {
@@ -126,10 +79,14 @@ fn default_handler(req: Request) -> () {
     };
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("X-Custom-Rust-Header".to_string(), "foo".to_string());
-    let _ = send_response(req.handle, 200, &headers, data_ptr, bytes.len());
+    let headers_json = serde_json::to_vec(&headers)?;
+    let headers_ptr = headers_json.as_ptr() as *const c_char;
+    let handle_ptr = req.handle as *mut c_void;
+    send_response(handle_ptr, 200, headers_ptr, headers_json.len() as c_int, data_ptr, bytes.len() as c_int);
+    Ok(())
 }
 
-fn receive_request() -> Result<(), Error> {
+fn receive_request(send_response: SendResponseFun) -> Result<(), Error> {
     // get receiver
     let recv_guard = match RECEIVER.lock() {
         Ok(guard) => guard,
@@ -146,27 +103,10 @@ fn receive_request() -> Result<(), Error> {
         }
     };
 
-    // get handler
-    let mut handler_guard = match HANDLER.lock() {
-        Ok(val) => val,
-        Err(err) => {
-            let msg = format!("Error accessing handler, message: [{}]", err);
-            return Err(Error::new(ErrorKind::Other, msg));
-        }
-    };
-    let handler = match &*handler_guard {
-        Some(val) => val,
-        None => {
-            let msg = format!("Error accessing handler");
-            return Err(Error::new(ErrorKind::Other, msg));
-        }
-    };
-
     // receive message
     match receiver.recv() {
         Ok(req) => {
-            handler(req);
-            Ok(())
+            default_handler(req, send_response)
         }
         Err(err) => {
             let msg = format!("Queue receive failed, message: [{}]", err.to_string());
@@ -209,26 +149,10 @@ fn bch_initialize(
     let global_receiver = &mut *receiver_guard;
     *global_receiver = Some(receiver);
 
-    // set global response fun
-    let mut send_response_guard = match SEND_RESPONSE.lock() {
-        Ok(val) => val,
-        Err(_) => return -3
-    };
-    let global_send_response = &mut *send_response_guard;
-    *global_send_response = Some(response_callback);
-
-    // set default handler
-    let mut handler_guard = match HANDLER.lock() {
-        Ok(val) => val,
-        Err(_) => return -4
-    };
-    let global_hander = &mut *handler_guard;
-    *global_hander = Some(Box::new(default_handler));
-
     // spawn worker thread
-    thread::spawn(|| {
+    thread::spawn(move || {
         loop {
-            match receive_request() {
+            match receive_request(response_callback) {
                 Ok(_) => (),
                 Err(err) => eprintln!("{}", err)
             }
