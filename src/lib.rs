@@ -61,6 +61,7 @@ struct Metadata {
 }
 
 struct Request {
+    poisoned: bool,
     handle: u64,
     meta: Metadata,
     data_ptr: u64,
@@ -68,7 +69,9 @@ struct Request {
 }
 
 fn default_handler(req: Request, send_response: SendResponseFun) -> Result<(), Error> {
-    let msg = format!("Hello from Rust, your request was received on path: [{}]\n", req.meta.uri);
+    let msg = format!(
+            "Hello from Rust, your request was received on path: [{}], data_ptr: [{}], data_len: [{}]\n",
+            req.meta.uri, req.data_ptr, req.data_len);
     let bytes = msg.as_bytes();
     let data_ptr = unsafe {
         let buf: *mut c_char = libc::malloc(bytes.len()) as *mut c_char;
@@ -86,7 +89,7 @@ fn default_handler(req: Request, send_response: SendResponseFun) -> Result<(), E
     Ok(())
 }
 
-fn receive_request(send_response: SendResponseFun) -> Result<(), Error> {
+fn receive_request(send_response: SendResponseFun) -> Result<bool, Error> {
     // get receiver
     let recv_guard = match RECEIVER.lock() {
         Ok(guard) => guard,
@@ -106,7 +109,13 @@ fn receive_request(send_response: SendResponseFun) -> Result<(), Error> {
     // receive message
     match receiver.recv() {
         Ok(req) => {
-            default_handler(req, send_response)
+            if req.poisoned {
+                return Ok(true)
+            }
+            match default_handler(req, send_response) {
+                Ok(_) => Ok(false),
+                Err(e) => Err(e)
+            }
         }
         Err(err) => {
             let msg = format!("Queue receive failed, message: [{}]", err.to_string());
@@ -153,10 +162,15 @@ fn bch_initialize(
     thread::spawn(move || {
         loop {
             match receive_request(response_callback) {
-                Ok(_) => (),
+                Ok(shutdown) => {
+                    if shutdown {
+                        break;
+                    }
+                },
                 Err(err) => eprintln!("{}", err)
             }
         }
+        eprintln!("Rust handler worker thread exit");
     });
 
     0
@@ -179,6 +193,7 @@ fn bch_receive_request(
     };
 
     let req = Request {
+        poisoned: false,
         handle: handle as u64,
         meta,
         data_ptr: data as u64,
@@ -210,5 +225,38 @@ fn bch_free_response_data(
 ) -> () {
     unsafe {
         libc::free(data);
+    }
+}
+
+#[no_mangle]
+fn bch_shutdown() -> () {
+    let req = Request {
+        poisoned: true,
+        handle: 0,
+        meta: Metadata {
+            uri: String::new(),
+            args: String::new(),
+            unparsedUri: String::new(),
+            method: String::new(),
+            protocol: String::new(),
+            dataTempFile: None,
+            headers: HashMap::new(),
+        },
+        data_ptr: 0,
+        data_len: 0,
+    };
+
+    let guard = match SENDER.lock() {
+        Ok(val) => val,
+        Err(_) => return ()
+    };
+
+    let opt = &*guard;
+
+    if let Some(sender) = opt {
+        match sender.send(req) {
+            Ok(_) => (),
+            Err(_) => ()
+        }
     }
 }
